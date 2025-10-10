@@ -199,12 +199,17 @@ impl Keypair {
 
     #[cfg(feature = "dilithium")]
     pub fn dilithium_from_bytes(bytes: &[u8]) -> Result<Keypair, DecodingError> {
-        log::debug!(target: "libp2p-identity", "🔐 Loading Dilithium keypair from bytes");
-        Ok(Keypair {
-            keypair: KeyPairInner::Dilithium(ml_dsa_87::Keypair::from_bytes(bytes).map_err(
-                |e| DecodingError::new(format!("failed to decode Dilithium keypair: {}", e)),
-            )?),
-        })
+        log::debug!(target: "libp2p-identity", "🔐 X Loading Dilithium keypair from bytes");
+        match ml_dsa_87::Keypair::from_bytes(bytes) {
+            Ok(keypair) => Ok(Keypair {
+                keypair: KeyPairInner::Dilithium(keypair),
+            }),
+            Err(e) => {
+                let error_msg = format!("failed to decode Dilithium keypair: {}", e);
+                log::error!(target: "libp2p-identity", "{}", error_msg);
+                Err(DecodingError::new(error_msg))
+            }
+        }
     }
 
     #[cfg(feature = "dilithium")]
@@ -1261,7 +1266,7 @@ mod tests {
         let bytes = original_keypair.dilithium_to_bytes();
 
         // Convert back from bytes
-        let roundtrip_keypair = Keypair::dilithium_from_bytes(bytes.clone()).unwrap();
+        let roundtrip_keypair = Keypair::dilithium_from_bytes(bytes.clone().as_slice()).unwrap();
 
         // Verify that the roundtrip keypair produces the same bytes
         let roundtrip_bytes = roundtrip_keypair.dilithium_to_bytes();
