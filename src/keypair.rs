@@ -139,7 +139,7 @@ impl Keypair {
         let mut entropy = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut entropy);
         Keypair {
-            keypair: KeyPairInner::Dilithium(ml_dsa_87::Keypair::generate(Some(&entropy))),
+            keypair: KeyPairInner::Dilithium(ml_dsa_87::Keypair::generate(&entropy)),
         }
     }
 
@@ -248,7 +248,7 @@ impl Keypair {
             #[cfg(feature = "dilithium")]
             KeyPairInner::Dilithium(ref pair) => {
                 log::trace!(target: "libp2p-identity", "🛡️ Signing with Dilithium (Post-Quantum)");
-                Ok(pair.sign(msg, None, false).to_vec())
+                Ok(pair.sign(msg, None, None).to_vec())
             }
         }
     }
