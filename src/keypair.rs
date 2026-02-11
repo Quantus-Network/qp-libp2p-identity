@@ -53,7 +53,7 @@ use crate::{
     error::{DecodingError, SigningError},
     KeyType,
 };
-use qp_rusty_crystals_dilithium::ml_dsa_87;
+use qp_rusty_crystals_dilithium::{ml_dsa_87, SensitiveBytes32};
 #[cfg(any(
     feature = "ecdsa",
     feature = "secp256k1",
@@ -138,8 +138,9 @@ impl Keypair {
         use rand::RngCore;
         let mut entropy = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut entropy);
+        let sensitive_entropy = SensitiveBytes32::from(&mut entropy);
         Keypair {
-            keypair: KeyPairInner::Dilithium(ml_dsa_87::Keypair::generate(&entropy)),
+            keypair: KeyPairInner::Dilithium(ml_dsa_87::Keypair::generate(sensitive_entropy)),
         }
     }
 
@@ -248,7 +249,10 @@ impl Keypair {
             #[cfg(feature = "dilithium")]
             KeyPairInner::Dilithium(ref pair) => {
                 log::trace!(target: "libp2p-identity", "🛡️ Signing with Dilithium (Post-Quantum)");
-                Ok(pair.sign(msg, None, None).to_vec())
+                Ok(pair
+                    .sign(msg, None, None)
+                    .map_err(|e| SigningError::new(format!("Dilithium signing failed: {:?}", e)))?
+                    .to_vec())
             }
         }
     }

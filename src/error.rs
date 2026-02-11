@@ -113,7 +113,10 @@ pub struct SigningError {
 
 /// An error during encoding of key material.
 impl SigningError {
-    #[cfg(all(feature = "rsa", not(target_arch = "wasm32")))]
+    #[cfg(any(
+        all(feature = "rsa", not(target_arch = "wasm32")),
+        feature = "dilithium"
+    ))]
     pub(crate) fn new<S: ToString>(msg: S) -> Self {
         Self {
             msg: msg.to_string(),
