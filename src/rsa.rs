@@ -253,6 +253,13 @@ impl DerDecodable<'_> for Asn1RsaEncryption {
 /// i.e. encoded as a DER BIT STRING.
 struct Asn1SubjectPublicKey(PublicKey);
 
+/// Maximum allowed size for an RSA public key in PKCS#1 DER format.
+/// This library supports RSA keys from 2048 to 8192 bits (via ring's RSA_PKCS1_2048_8192_SHA256).
+/// An 8192-bit RSA modulus is 1024 bytes, plus the public exponent and DER overhead.
+/// We set a generous limit of 1200 bytes to accommodate the largest supported keys
+/// while preventing denial-of-service through oversized allocations.
+const MAX_RSA_PKCS1_DER_SIZE: usize = 1200;
+
 impl DerEncodable for Asn1SubjectPublicKey {
     fn encode<S: Sink>(&self, sink: &mut S) -> Result<(), Asn1DerError> {
         let pk_der = &(self.0).0;
@@ -274,9 +281,84 @@ impl DerDecodable<'_> for Asn1SubjectPublicKey {
             )));
         }
 
-        let pk_der: Vec<u8> = object.value().iter().skip(1).cloned().collect();
-        // We don't parse pk_der further as an ASN.1 RsaPublicKey, since
-        // we only need the DER encoding for `verify`.
+        let value = object.value();
+
+        // The BIT STRING must have at least one byte (the "unused bits" byte)
+        // plus the actual key data
+        if value.is_empty() {
+            return Err(Asn1DerError::new(Asn1DerErrorVariant::InvalidData(
+                "RSA public key BIT STRING is empty.",
+            )));
+        }
+
+        // Check the "unused bits" byte - for RSA keys this should be 0
+        // (key length is always a multiple of 8 bits)
+        if value[0] != 0 {
+            return Err(Asn1DerError::new(Asn1DerErrorVariant::InvalidData(
+                "RSA public key BIT STRING has non-zero unused bits.",
+            )));
+        }
+
+        // Check size bounds BEFORE allocating to prevent DoS via oversized inputs.
+        // The key data is everything after the "unused bits" byte.
+        let key_data_len = value.len() - 1;
+        if key_data_len > MAX_RSA_PKCS1_DER_SIZE {
+            return Err(Asn1DerError::new(Asn1DerErrorVariant::InvalidData(
+                "RSA public key exceeds maximum allowed size.",
+            )));
+        }
+
+        // Validate that the inner data is a valid DER SEQUENCE (PKCS#1 RSAPublicKey structure)
+        // before allocating. The first byte should be 0x30 (SEQUENCE tag).
+        let key_data = &value[1..];
+        if key_data.is_empty() || key_data[0] != 0x30 {
+            return Err(Asn1DerError::new(Asn1DerErrorVariant::InvalidData(
+                "RSA public key is not a valid PKCS#1 RSAPublicKey SEQUENCE.",
+            )));
+        }
+
+        // Parse as a DER object to validate the structure before allocating a Vec
+        let inner_obj = DerObject::decode(key_data).map_err(|_| {
+            Asn1DerError::new(Asn1DerErrorVariant::InvalidData(
+                "RSA public key contains invalid DER encoding.",
+            ))
+        })?;
+
+        // Verify it's a SEQUENCE with the expected structure (n INTEGER, e INTEGER)
+        let seq = Sequence::load(inner_obj).map_err(|_| {
+            Asn1DerError::new(Asn1DerErrorVariant::InvalidData(
+                "RSA public key is not a valid SEQUENCE.",
+            ))
+        })?;
+
+        // PKCS#1 RSAPublicKey has exactly 2 elements: modulus (n) and exponent (e)
+        if seq.len() != 2 {
+            return Err(Asn1DerError::new(Asn1DerErrorVariant::InvalidData(
+                "RSA public key SEQUENCE does not have exactly 2 elements.",
+            )));
+        }
+
+        // Verify both elements are INTEGERs (tag 0x02)
+        let n_obj = seq.get(0).map_err(|_| {
+            Asn1DerError::new(Asn1DerErrorVariant::InvalidData(
+                "Failed to get RSA modulus from SEQUENCE.",
+            ))
+        })?;
+        let e_obj = seq.get(1).map_err(|_| {
+            Asn1DerError::new(Asn1DerErrorVariant::InvalidData(
+                "Failed to get RSA exponent from SEQUENCE.",
+            ))
+        })?;
+
+        if n_obj.tag() != 2 || e_obj.tag() != 2 {
+            return Err(Asn1DerError::new(Asn1DerErrorVariant::InvalidData(
+                "RSA public key components are not INTEGERs.",
+            )));
+        }
+
+        // Now that we've validated the structure, allocate the Vec
+        let pk_der: Vec<u8> = key_data.to_vec();
+
         Ok(Self(PublicKey(pk_der)))
     }
 }
@@ -358,5 +440,99 @@ mod tests {
         QuickCheck::new()
             .tests(10)
             .quickcheck(prop as fn(_, _) -> _);
+    }
+
+    #[test]
+    fn rsa_reject_oversized_public_key() {
+        // Construct a malicious X.509 SubjectPublicKeyInfo with an oversized BIT STRING
+        // This should be rejected before any large allocation occurs
+
+        // RSA algorithm identifier: SEQUENCE { OID rsaEncryption, NULL }
+        let alg_id: &[u8] = &[
+            0x30, 0x0d, // SEQUENCE, length 13
+            0x06, 0x09, // OID, length 9
+            0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, // rsaEncryption OID
+            0x05, 0x00, // NULL
+        ];
+
+        // Create a BIT STRING claiming to contain a huge key (but with minimal actual data)
+        // BIT STRING tag = 0x03, then length encoding for > MAX_RSA_PKCS1_DER_SIZE
+        // We'll use a length that exceeds the limit
+        let oversized_len = MAX_RSA_PKCS1_DER_SIZE + 100;
+
+        // Construct the BIT STRING with long-form length encoding
+        let mut bit_string = vec![0x03]; // BIT STRING tag
+        // Long-form length: 0x82 means 2 bytes follow for length
+        bit_string.push(0x82);
+        bit_string.push(((oversized_len >> 8) & 0xff) as u8);
+        bit_string.push((oversized_len & 0xff) as u8);
+        bit_string.push(0x00); // unused bits byte
+        // Add minimal fake data (not a valid RSA key, but we should reject on size first)
+        bit_string.extend(vec![0x30; oversized_len - 1]); // Pad with SEQUENCE tags
+
+        // Build the full SPKI structure
+        let mut spki = vec![0x30]; // SEQUENCE tag
+        let inner_len = alg_id.len() + bit_string.len();
+        // Long-form length for outer SEQUENCE
+        spki.push(0x82);
+        spki.push(((inner_len >> 8) & 0xff) as u8);
+        spki.push((inner_len & 0xff) as u8);
+        spki.extend_from_slice(alg_id);
+        spki.extend_from_slice(&bit_string);
+
+        let result = PublicKey::try_decode_x509(&spki);
+        assert!(result.is_err(), "Oversized RSA public key should be rejected");
+    }
+
+    #[test]
+    fn rsa_reject_invalid_inner_structure() {
+        // Construct an X.509 SPKI with a BIT STRING that doesn't contain a valid PKCS#1 structure
+
+        // RSA algorithm identifier
+        let alg_id: &[u8] = &[
+            0x30, 0x0d,
+            0x06, 0x09,
+            0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01,
+            0x05, 0x00,
+        ];
+
+        // BIT STRING containing garbage instead of a valid RSA key
+        let invalid_key: &[u8] = &[
+            0x03, 0x05, // BIT STRING, length 5
+            0x00,       // unused bits = 0
+            0x01, 0x02, 0x03, 0x04, // garbage data (not starting with 0x30 SEQUENCE)
+        ];
+
+        let mut spki = vec![0x30]; // SEQUENCE tag
+        let inner_len = alg_id.len() + invalid_key.len();
+        spki.push(inner_len as u8);
+        spki.extend_from_slice(alg_id);
+        spki.extend_from_slice(invalid_key);
+
+        let result = PublicKey::try_decode_x509(&spki);
+        assert!(result.is_err(), "Invalid inner structure should be rejected");
+    }
+
+    #[test]
+    fn rsa_reject_empty_bit_string() {
+        // RSA algorithm identifier
+        let alg_id: &[u8] = &[
+            0x30, 0x0d,
+            0x06, 0x09,
+            0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01,
+            0x05, 0x00,
+        ];
+
+        // Empty BIT STRING
+        let empty_key: &[u8] = &[0x03, 0x00]; // BIT STRING, length 0
+
+        let mut spki = vec![0x30];
+        let inner_len = alg_id.len() + empty_key.len();
+        spki.push(inner_len as u8);
+        spki.extend_from_slice(alg_id);
+        spki.extend_from_slice(empty_key);
+
+        let result = PublicKey::try_decode_x509(&spki);
+        assert!(result.is_err(), "Empty BIT STRING should be rejected");
     }
 }
