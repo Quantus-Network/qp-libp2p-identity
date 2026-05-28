@@ -24,7 +24,7 @@ use super::error::DecodingError;
 use core::cmp;
 use core::fmt;
 use core::hash;
-use ed25519_dalek::{self as ed25519, Signer as _, Verifier as _};
+use ed25519_dalek::{self as ed25519, Signer as _};
 use std::convert::TryFrom;
 use zeroize::Zeroize;
 
@@ -141,9 +141,17 @@ impl cmp::Ord for PublicKey {
 
 impl PublicKey {
     /// Verify the Ed25519 signature on a message using the public key.
+    ///
+    /// This function uses strict verification which:
+    /// - Rejects weak (small-order) public keys
+    /// - Rejects signatures with malleable components (torsion in R)
+    /// - Ensures the signature scalar is properly reduced
+    ///
+    /// These checks are important for protocols that rely on signature verification
+    /// as proof of key possession.
     pub fn verify(&self, msg: &[u8], sig: &[u8]) -> bool {
         ed25519::Signature::try_from(sig)
-            .and_then(|s| self.0.verify(msg, &s))
+            .and_then(|s| self.0.verify_strict(msg, &s))
             .is_ok()
     }
 
@@ -154,12 +162,26 @@ impl PublicKey {
     }
 
     /// Try to parse a public key from a byte array containing the actual key as produced by `to_bytes`.
+    ///
+    /// This function rejects weak (small-order) public keys to prevent signature forgery attacks.
+    /// Small-order public keys can be used to create signatures that verify without knowledge
+    /// of the corresponding private key, breaking proof-of-possession guarantees.
     pub fn try_from_bytes(k: &[u8]) -> Result<PublicKey, DecodingError> {
         let k = <[u8; 32]>::try_from(k)
             .map_err(|e| DecodingError::failed_to_parse("Ed25519 public key", e))?;
-        ed25519::VerifyingKey::from_bytes(&k)
-            .map_err(|e| DecodingError::failed_to_parse("Ed25519 public key", e))
-            .map(PublicKey)
+        let vk = ed25519::VerifyingKey::from_bytes(&k)
+            .map_err(|e| DecodingError::failed_to_parse("Ed25519 public key", e))?;
+
+        // Reject weak/small-order public keys to prevent signature forgery.
+        // Small-order points (like the identity point) can satisfy the verification
+        // equation for trivial signatures without requiring knowledge of a private key.
+        if vk.is_weak() {
+            return Err(DecodingError::new(
+                "Ed25519 weak public key rejected: small-order points are not allowed".to_string(),
+            ));
+        }
+
+        Ok(PublicKey(vk))
     }
 }
 
@@ -254,5 +276,93 @@ mod tests {
 
         let invalid_msg = "h3ll0 w0rld".as_bytes();
         assert!(!pk.verify(invalid_msg, &sig));
+    }
+
+    /// The 8 small-order points on the Ed25519 curve (the 8-torsion subgroup).
+    /// These are weak public keys that can be used to forge signatures.
+    /// Reference: https://cr.yp.to/ecdh/curve25519-20060209.pdf
+    const SMALL_ORDER_POINTS: [[u8; 32]; 8] = [
+        // Identity point (neutral element)
+        [
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ],
+        // Order 8 point
+        [
+            0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0x7f,
+        ],
+        // Order 8 point  
+        [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x80,
+        ],
+        // Order 2 point
+        [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ],
+        // Order 4 point
+        [
+            0xc7, 0x17, 0x6a, 0x70, 0x3d, 0x4d, 0xd8, 0x4f, 0xba, 0x3c, 0x0b, 0x76, 0x0d, 0x10,
+            0x67, 0x0f, 0x2a, 0x20, 0x53, 0xfa, 0x2c, 0x39, 0xcc, 0xc6, 0x4e, 0xc7, 0xfd, 0x77,
+            0x92, 0xac, 0x03, 0x7a,
+        ],
+        // Order 4 point
+        [
+            0xc7, 0x17, 0x6a, 0x70, 0x3d, 0x4d, 0xd8, 0x4f, 0xba, 0x3c, 0x0b, 0x76, 0x0d, 0x10,
+            0x67, 0x0f, 0x2a, 0x20, 0x53, 0xfa, 0x2c, 0x39, 0xcc, 0xc6, 0x4e, 0xc7, 0xfd, 0x77,
+            0x92, 0xac, 0x03, 0xfa,
+        ],
+        // Order 8 point
+        [
+            0x26, 0xe8, 0x95, 0x8f, 0xc2, 0xb2, 0x27, 0xb0, 0x45, 0xc3, 0xf4, 0x89, 0xf2, 0xef,
+            0x98, 0xf0, 0xd5, 0xdf, 0xac, 0x05, 0xd3, 0xc6, 0x33, 0x39, 0xb1, 0x38, 0x02, 0x88,
+            0x6d, 0x53, 0xfc, 0x05,
+        ],
+        // Order 8 point
+        [
+            0x26, 0xe8, 0x95, 0x8f, 0xc2, 0xb2, 0x27, 0xb0, 0x45, 0xc3, 0xf4, 0x89, 0xf2, 0xef,
+            0x98, 0xf0, 0xd5, 0xdf, 0xac, 0x05, 0xd3, 0xc6, 0x33, 0x39, 0xb1, 0x38, 0x02, 0x88,
+            0x6d, 0x53, 0xfc, 0x85,
+        ],
+    ];
+
+    #[test]
+    fn reject_weak_public_keys_on_import() {
+        // Test that all small-order (weak) public keys are rejected during import
+        for (i, weak_key) in SMALL_ORDER_POINTS.iter().enumerate() {
+            let result = PublicKey::try_from_bytes(weak_key);
+            assert!(
+                result.is_err(),
+                "Small-order point #{} should be rejected but was accepted",
+                i
+            );
+            
+            // Verify the error message mentions weak keys
+            let err = result.unwrap_err();
+            let err_msg = err.to_string();
+            assert!(
+                err_msg.contains("weak") || err_msg.contains("small-order"),
+                "Error message should mention weak/small-order keys, got: {}",
+                err_msg
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "rand")]
+    fn valid_public_keys_are_accepted() {
+        // Ensure that normal valid public keys are still accepted
+        for _ in 0..10 {
+            let kp = Keypair::generate();
+            let pk_bytes = kp.public().to_bytes();
+            let result = PublicKey::try_from_bytes(&pk_bytes);
+            assert!(result.is_ok(), "Valid public key should be accepted");
+        }
     }
 }
