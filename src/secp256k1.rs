@@ -112,13 +112,35 @@ impl SecretKey {
     ///
     /// [RFC5915]: https://tools.ietf.org/html/rfc5915
     pub fn from_der(mut der: impl AsMut<[u8]>) -> Result<SecretKey, DecodingError> {
-        // TODO: Stricter parsing.
         let der_obj = der.as_mut();
 
-        let mut sk_bytes = Sequence::decode(der_obj)
-            .and_then(|seq| seq.get(1))
-            .and_then(Vec::load)
-            .map_err(|e| DecodingError::failed_to_parse("secp256k1 SecretKey bytes", e))?;
+        let seq = Sequence::decode(der_obj)
+            .map_err(|e| DecodingError::failed_to_parse("secp256k1 ECPrivateKey SEQUENCE", e))?;
+
+        // Get the private key octet string (element at index 1 in ECPrivateKey)
+        let pk_obj = seq
+            .get(1)
+            .map_err(|e| DecodingError::failed_to_parse("secp256k1 privateKey field", e))?;
+
+        // Verify it's an OCTET STRING (tag 0x04)
+        if pk_obj.tag() != 4 {
+            return Err(DecodingError::new(
+                "secp256k1 privateKey is not an OCTET STRING".to_string(),
+            ));
+        }
+
+        // Check the size BEFORE allocating - secp256k1 secret keys are exactly 32 bytes
+        let pk_value = pk_obj.value();
+        if pk_value.len() != 32 {
+            return Err(DecodingError::new(format!(
+                "secp256k1 privateKey has invalid length: expected 32 bytes, got {}",
+                pk_value.len()
+            )));
+        }
+
+        // Now we can safely copy into a fixed-size array (no heap allocation for key material)
+        let mut sk_bytes = [0u8; 32];
+        sk_bytes.copy_from_slice(pk_value);
 
         let sk = SecretKey::try_from_bytes(&mut sk_bytes)?;
         sk_bytes.zeroize();
@@ -236,5 +258,138 @@ mod tests {
         let sk2 = SecretKey::try_from_bytes(&mut sk_bytes).unwrap();
         assert_eq!(sk1.0.serialize(), sk2.0.serialize());
         assert_eq!(sk_bytes, [0; 32]);
+    }
+
+    #[test]
+    fn secp256k1_reject_oversized_der_private_key() {
+        // Construct a malicious ECPrivateKey DER structure with an oversized private key field
+        // ECPrivateKey ::= SEQUENCE {
+        //   version        INTEGER { ecPrivkeyVer1(1) } (ecPrivkeyVer1),
+        //   privateKey     OCTET STRING,  <- This should be exactly 32 bytes
+        //   parameters [0] ECParameters {{ NamedCurve }} OPTIONAL,
+        //   publicKey  [1] BIT STRING OPTIONAL
+        // }
+
+        // Build an ECPrivateKey with a 64-byte (oversized) private key
+        let oversized_key = vec![0xAB; 64]; // 64 bytes instead of 32
+
+        let mut der = Vec::new();
+        // SEQUENCE tag
+        der.push(0x30);
+
+        // Calculate inner length
+        let version_len = 3; // INTEGER 1
+        let pk_len = 2 + oversized_key.len(); // OCTET STRING header + data
+        let inner_len = version_len + pk_len;
+
+        // Length (short form since < 128)
+        der.push(inner_len as u8);
+
+        // version INTEGER = 1
+        der.push(0x02); // INTEGER tag
+        der.push(0x01); // length 1
+        der.push(0x01); // value 1
+
+        // privateKey OCTET STRING (oversized)
+        der.push(0x04); // OCTET STRING tag
+        der.push(oversized_key.len() as u8); // length
+        der.extend_from_slice(&oversized_key);
+
+        let result = SecretKey::from_der(&mut der);
+        assert!(result.is_err(), "Oversized secp256k1 private key should be rejected");
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("invalid length") || err_msg.contains("32"),
+            "Error should mention invalid length, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn secp256k1_reject_undersized_der_private_key() {
+        // Build an ECPrivateKey with a 16-byte (undersized) private key
+        let undersized_key = vec![0xAB; 16]; // 16 bytes instead of 32
+
+        let mut der = Vec::new();
+        der.push(0x30); // SEQUENCE
+
+        let version_len = 3;
+        let pk_len = 2 + undersized_key.len();
+        let inner_len = version_len + pk_len;
+        der.push(inner_len as u8);
+
+        // version
+        der.push(0x02);
+        der.push(0x01);
+        der.push(0x01);
+
+        // privateKey OCTET STRING (undersized)
+        der.push(0x04);
+        der.push(undersized_key.len() as u8);
+        der.extend_from_slice(&undersized_key);
+
+        let result = SecretKey::from_der(&mut der);
+        assert!(result.is_err(), "Undersized secp256k1 private key should be rejected");
+    }
+
+    #[test]
+    fn secp256k1_reject_non_octet_string_private_key() {
+        // Build an ECPrivateKey where the private key field is not an OCTET STRING
+        let fake_key = vec![0xAB; 32];
+
+        let mut der = Vec::new();
+        der.push(0x30); // SEQUENCE
+
+        let version_len = 3;
+        let pk_len = 2 + fake_key.len();
+        let inner_len = version_len + pk_len;
+        der.push(inner_len as u8);
+
+        // version
+        der.push(0x02);
+        der.push(0x01);
+        der.push(0x01);
+
+        // Use INTEGER tag (0x02) instead of OCTET STRING (0x04)
+        der.push(0x02); // Wrong tag!
+        der.push(fake_key.len() as u8);
+        der.extend_from_slice(&fake_key);
+
+        let result = SecretKey::from_der(&mut der);
+        assert!(result.is_err(), "Non-OCTET-STRING private key should be rejected");
+    }
+
+    #[test]
+    #[cfg(feature = "rand")]
+    fn secp256k1_valid_der_roundtrip() {
+        // Generate a valid key and verify we can create a proper DER encoding that works
+        let sk = SecretKey::generate();
+        let sk_bytes = sk.to_bytes();
+
+        // Build a minimal valid ECPrivateKey DER
+        let mut der = Vec::new();
+        der.push(0x30); // SEQUENCE
+
+        let version_len = 3;
+        let pk_len = 2 + 32; // OCTET STRING header + 32-byte key
+        let inner_len = version_len + pk_len;
+        der.push(inner_len as u8);
+
+        // version INTEGER = 1
+        der.push(0x02);
+        der.push(0x01);
+        der.push(0x01);
+
+        // privateKey OCTET STRING
+        der.push(0x04);
+        der.push(32);
+        der.extend_from_slice(&sk_bytes);
+
+        let result = SecretKey::from_der(&mut der);
+        assert!(result.is_ok(), "Valid DER-encoded key should be accepted");
+
+        let decoded_sk = result.unwrap();
+        assert_eq!(decoded_sk.to_bytes(), sk_bytes, "Decoded key should match original");
     }
 }
